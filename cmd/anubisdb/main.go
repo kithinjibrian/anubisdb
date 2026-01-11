@@ -1,4 +1,3 @@
-// cmd/anubisdb/main.go
 package main
 
 import (
@@ -14,7 +13,13 @@ import (
 func main() {
 	fmt.Println("Welcome to AnubisDB! Type 'exit' to quit.")
 
-	db, err := engine.NewEngine("anubis.db")
+	dbName := "anubis.db"
+
+	if len(os.Args) > 1 {
+		dbName = os.Args[1]
+	}
+
+	db, err := engine.NewEngine(dbName)
 	if err != nil {
 		fmt.Println("Error initializing database:", err)
 		return
@@ -24,7 +29,7 @@ func main() {
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
-		fmt.Print("> ")
+		fmt.Print("anubis> ")
 		input, _ := reader.ReadString('\n')
 		input = strings.TrimSpace(input)
 
