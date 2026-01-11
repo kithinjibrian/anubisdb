@@ -1,0 +1,20 @@
+statement     = select_stmt | insert_stmt | delete_stmt | create_table_stmt
+
+select_stmt   = "SELECT" column_list "FROM" identifier [ where_clause ]
+insert_stmt   = "INSERT" "INTO" identifier [ "(" column_list ")" ] "VALUES" "(" value_list ")"
+delete_stmt   = "DELETE" "FROM" identifier [ where_clause ]
+create_table_stmt = "CREATE" "TABLE" identifier "(" column_def { "," column_def } ")"
+
+where_clause  = "WHERE" condition { ( "AND" | "OR" ) condition }
+condition     = identifier operator value
+
+column_list   = ( "*" | identifier { "," identifier } )
+value_list    = value { "," value }
+column_def    = identifier data_type { constraint }
+
+constraint    = "PRIMARY" "KEY" | "UNIQUE" | "NOT" "NULL" | "AUTO_INCREMENT"
+
+value         = string | number | identifier
+operator      = "=" | "!=" | "<" | ">" | "<=" | ">="
+data_type     = "INT" | "VARCHAR" | "TEXT" | "BOOLEAN" | "DATE" | "DECIMAL" | "FLOAT"
+identifier    = letter { letter | digit | "_" }
