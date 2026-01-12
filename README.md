@@ -341,7 +341,7 @@ The planner considers:
 
 All data is automatically persisted to disk using a custom page-based storage format:
 
-```bash
+```sql
 $ ./anubisdb data.db
 anubis> CREATE TABLE test (id INT PRIMARY KEY, value TEXT)
 anubis> INSERT INTO test (id, value) VALUES (1, hello)
@@ -365,36 +365,6 @@ id              | value
 
 ---
 
-## Roadmap
-
-AnubisDB is under active development. Here's what's coming:
-
-### Short-Term (v0.2)
-
-- [ ] Additional aggregate functions (`SUM`, `AVG`, `MIN`, `MAX`)
-- [ ] `LIKE` operator for pattern matching
-- [ ] `IN` operator for value lists
-- [ ] Composite indexes (multi-column)
-- [ ] Better error messages and SQL validation
-
-### Medium-Term (v0.3)
-
-- [ ] Write-Ahead Log (WAL) for crash recovery
-- [ ] ACID transaction support (`BEGIN`, `COMMIT`, `ROLLBACK`)
-- [ ] Foreign key constraints
-- [ ] `ALTER TABLE` support
-- [ ] Hash join algorithm
-
-### Long-Term (v1.0)
-
-- [ ] Multi-version concurrency control (MVCC)
-- [ ] Query result caching
-- [ ] Network protocol (PostgreSQL wire protocol)
-- [ ] Replication and high availability
-- [ ] Query parallelization
-
----
-
 ## Limitations
 
 ### Current Constraints
@@ -404,12 +374,6 @@ AnubisDB is under active development. Here's what's coming:
 - **Memory-Based Operations**: Joins, sorts, and groups happen entirely in memory
 - **Limited Aggregates**: Only `COUNT(*)` is currently implemented
 - **No Subqueries**: Nested SELECT statements not yet supported
-
-### Known Issues
-
-- Crash during write operations may corrupt the database file
-- Large result sets may cause memory pressure
-- No query timeout mechanism
 
 ---
 
