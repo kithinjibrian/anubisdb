@@ -413,32 +413,6 @@ AnubisDB is under active development. Here's what's coming:
 
 ---
 
-## Contributing
-
-Contributions are welcome! Here are some ways to help:
-
-- **Report Bugs**: Open an issue with reproduction steps
-- **Suggest Features**: Propose new SQL features or optimizations
-- **Submit PRs**: Fix bugs, add tests, or implement roadmap items
-- **Documentation**: Improve examples and architectural explanations
-
-### Development Setup
-
-```bash
-git clone https://github.com/kithinjibrian/anubisdb.git
-cd anubisdb
-go mod download
-go test ./...
-```
-
----
-
-## License
-
-MIT License - see [LICENSE](LICENSE) file for details.
-
----
-
 ## Acknowledgments
 
 Built with inspiration from:
