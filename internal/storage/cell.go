@@ -77,57 +77,62 @@ import (
 	"errors"
 )
 
-type Cell interface {
-	GetKey() uint64
-	Serialize() []byte
-	Size() uint32
-}
-
 type LeafCell struct {
-	Key   uint64
+	Key   Key
 	Value []byte
 }
 
-func NewLeafCell(key uint64, value []byte) *LeafCell {
+func NewLeafCell(key Key, value []byte) *LeafCell {
 	return &LeafCell{
 		Key:   key,
 		Value: value,
 	}
 }
 
-func (c *LeafCell) GetKey() uint64 {
-	return c.Key
-}
-
-func (c *LeafCell) Size() uint32 {
-	return 8 + 4 + uint32(len(c.Value))
-}
-
+// Serialize converts the leaf cell to bytes
+// Format: [key_length: 4 bytes][key_data: variable][value_length: 4 bytes][value_data: variable]
 func (c *LeafCell) Serialize() []byte {
-	size := c.Size()
-	data := make([]byte, size)
+	keyData := c.Key.Encode()
+	keyLen := len(keyData)
+	valueLen := len(c.Value)
 
-	binary.BigEndian.PutUint64(data[0:8], c.Key)
-	binary.BigEndian.PutUint32(data[8:12], uint32(len(c.Value)))
-	copy(data[12:], c.Value)
+	totalSize := 4 + keyLen + 4 + valueLen
+	buf := make([]byte, totalSize)
 
-	return data
+	binary.BigEndian.PutUint32(buf[0:4], uint32(keyLen))
+
+	copy(buf[4:4+keyLen], keyData)
+
+	binary.BigEndian.PutUint32(buf[4+keyLen:8+keyLen], uint32(valueLen))
+
+	copy(buf[8+keyLen:], c.Value)
+
+	return buf
 }
 
 func DeserializeLeafCell(data []byte) (*LeafCell, error) {
-	if len(data) < 12 {
-		return nil, errors.New("data too small for leaf cell header")
+	if len(data) < 8 {
+		return nil, errors.New("leaf cell data too short")
 	}
 
-	key := binary.BigEndian.Uint64(data[0:8])
-	valueLen := binary.BigEndian.Uint32(data[8:12])
+	keyLen := binary.BigEndian.Uint32(data[0:4])
+	if len(data) < int(4+keyLen+4) {
+		return nil, errors.New("invalid leaf cell data")
+	}
 
-	if len(data) < int(12+valueLen) {
-		return nil, errors.New("data too small for leaf cell value")
+	keyData := data[4 : 4+keyLen]
+	key, err := DecodeKey(keyData)
+	if err != nil {
+		return nil, err
+	}
+
+	valueLen := binary.BigEndian.Uint32(data[4+keyLen : 8+keyLen])
+	if len(data) < int(8+keyLen+valueLen) {
+		return nil, errors.New("value data truncated")
 	}
 
 	value := make([]byte, valueLen)
-	copy(value, data[12:12+valueLen])
+	copy(value, data[8+keyLen:8+keyLen+valueLen])
 
 	return &LeafCell{
 		Key:   key,
@@ -135,42 +140,58 @@ func DeserializeLeafCell(data []byte) (*LeafCell, error) {
 	}, nil
 }
 
+func (c *LeafCell) Size() uint32 {
+	keyData := c.Key.Encode()
+	return uint32(4 + len(keyData) + 4 + len(c.Value))
+}
+
 type InteriorCell struct {
-	Key       uint64
+	Key       Key
 	ChildPage uint32
 }
 
-func NewInteriorCell(key uint64, childPage uint32) *InteriorCell {
+func NewInteriorCell(key Key, childPage uint32) *InteriorCell {
 	return &InteriorCell{
 		Key:       key,
 		ChildPage: childPage,
 	}
 }
 
-func (c *InteriorCell) GetKey() uint64 {
-	return c.Key
-}
-
-func (c *InteriorCell) Size() uint32 {
-	return 12
-}
-
+// Serialize converts the interior cell to bytes
+// Format: [child_page: 4 bytes][key_length: 4 bytes][key_data: variable]
 func (c *InteriorCell) Serialize() []byte {
-	data := make([]byte, 12)
+	keyData := c.Key.Encode()
+	keyLen := len(keyData)
 
-	binary.BigEndian.PutUint64(data[0:8], c.Key)
-	binary.BigEndian.PutUint32(data[8:12], c.ChildPage)
+	totalSize := 4 + 4 + keyLen
+	buf := make([]byte, totalSize)
 
-	return data
+	binary.BigEndian.PutUint32(buf[0:4], c.ChildPage)
+
+	binary.BigEndian.PutUint32(buf[4:8], uint32(keyLen))
+
+	copy(buf[8:], keyData)
+
+	return buf
 }
 
 func DeserializeInteriorCell(data []byte) (*InteriorCell, error) {
-	if len(data) < 12 {
-		return nil, errors.New("data too small for interior cell")
+	if len(data) < 8 {
+		return nil, errors.New("interior cell data too short")
 	}
 
-	key := binary.BigEndian.Uint64(data[0:8])
-	childPage := binary.BigEndian.Uint32(data[8:12])
+	childPage := binary.BigEndian.Uint32(data[0:4])
+
+	keyLen := binary.BigEndian.Uint32(data[4:8])
+	if len(data) < int(8+keyLen) {
+		return nil, errors.New("invalid interior cell data")
+	}
+
+	keyData := data[8 : 8+keyLen]
+	key, err := DecodeKey(keyData)
+	if err != nil {
+		return nil, err
+	}
 
 	return &InteriorCell{
 		Key:       key,
@@ -178,76 +199,7 @@ func DeserializeInteriorCell(data []byte) (*InteriorCell, error) {
 	}, nil
 }
 
-func SerializeLeafCells(cells []*LeafCell) []byte {
-	if len(cells) == 0 {
-		return []byte{}
-	}
-
-	totalSize := 0
-	for _, cell := range cells {
-		totalSize += int(cell.Size())
-	}
-
-	data := make([]byte, 0, totalSize)
-	for _, cell := range cells {
-		data = append(data, cell.Serialize()...)
-	}
-
-	return data
-}
-
-func DeserializeLeafCells(data []byte) ([]*LeafCell, error) {
-	cells := []*LeafCell{}
-	offset := 0
-
-	for offset < len(data) {
-		if len(data)-offset < 12 {
-			break
-		}
-
-		valueLen := binary.BigEndian.Uint32(data[offset+8 : offset+12])
-		cellSize := 12 + int(valueLen)
-
-		if len(data)-offset < cellSize {
-			return nil, errors.New("incomplete cell data")
-		}
-
-		cell, err := DeserializeLeafCell(data[offset : offset+cellSize])
-		if err != nil {
-			return nil, err
-		}
-
-		cells = append(cells, cell)
-		offset += cellSize
-	}
-
-	return cells, nil
-}
-
-func SerializeInteriorCells(cells []*InteriorCell) []byte {
-	data := make([]byte, len(cells)*12)
-
-	for i, cell := range cells {
-		copy(data[i*12:(i+1)*12], cell.Serialize())
-	}
-
-	return data
-}
-
-func DeserializeInteriorCells(data []byte, count int) ([]*InteriorCell, error) {
-	if len(data) < count*12 {
-		return nil, errors.New("data too small for interior cells")
-	}
-
-	cells := make([]*InteriorCell, count)
-	for i := 0; i < count; i++ {
-		offset := i * 12
-		cell, err := DeserializeInteriorCell(data[offset : offset+12])
-		if err != nil {
-			return nil, err
-		}
-		cells[i] = cell
-	}
-
-	return cells, nil
+func (c *InteriorCell) Size() uint32 {
+	keyData := c.Key.Encode()
+	return uint32(4 + 4 + len(keyData))
 }

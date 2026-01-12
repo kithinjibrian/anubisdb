@@ -56,7 +56,7 @@ go build -o anubisdb ./cmd/anubisdb/main.go
 ```sql
 $ ./anubisdb pyramid.db
 
-anubis> CREATE TABLE test (id INT, val VARCHAR)
+anubis> CREATE TABLE test (id INT PRIMARY KEY, val VARCHAR)
 Table 'test' created successfully
 
 anubis> INSERT INTO test (id, val) VALUES (1, hello)

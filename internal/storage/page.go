@@ -75,41 +75,35 @@ package storage
  */
 
 /*
-Page Layout (4KB = 4096 bytes example):
-Offset
-0      |----------------|
-       | Page Header    |  PageType=Leaf, NumCells=3, CellContentOffset=3900
-8      |----------------|
-       | Cell Ptr [0]   |------------------+ <- Key=50, Value="Charlie" (46 bytes)
-10     | = 3950         |                  |
-       |----------------|                  |
-       | Cell Ptr [1]   |-------------+    |
-12     | = 3900         |             |    |
-       |----------------|             |    |
-       | Cell Ptr [2]   |--------+    |    |
-14     | = 4046         |        |    |    |
-       |----------------|        |    |    |
-       |                |        |    |    |
-       | Unallocated    |        |    |    |
-       | Space          |        |    |    |
-       |                |        |    |    |
-3900   |----------------|        |    |    |
-       | Cell 1 Data    |<-------|----+ <- Key=100, Value="Alice" (50 bytes)
-       |                |        |         |
-3950   |----------------|        |         |
-       | Cell 3 Data    |<-------|---------+
-       |                |		 |
-4046   |----------------|		 |
-       | Cell 2 Data    |<-------+ <- Key=200, Value="Bob" (50 bytes)
-       |                |
-4096   |________________| <- End of page
-
-Key Points:
-- Page is 4096 bytes total (0 to 4095)
-- Cell pointers SORTED by key: Ptr[0]=key 50, Ptr[1]=key 100, Ptr[2]=key 200
-- Cell content in arbitrary order, growing UP from bottom
-- Last cell starts at 4046 and goes to 4095 (50 bytes)
-*/
+** Page Layout (4KB = 4096 bytes example):
+** Offset
+** 0      |----------------|
+**        | Page Header    |  PageType=Leaf, NumCells=3, CellContentOffset=3900
+** 8      |----------------|
+**        | Cell Ptr [0]   |------------------+ <- Key=50, Value="Charlie" (46 bytes)
+** 10     | = 3950         |                  |
+**        |----------------|                  |
+**        | Cell Ptr [1]   |-------------+    |
+** 12     | = 3900         |             |    |
+**        |----------------|             |    |
+**        | Cell Ptr [2]   |--------+    |    |
+** 14     | = 4046         |        |    |    |
+**        |----------------|        |    |    |
+**        |                |        |    |    |
+**        | Unallocated    |        |    |    |
+**        | Space          |        |    |    |
+**        |                |        |    |    |
+** 3900   |----------------|        |    |    |
+**        | Cell 1 Data    |<-------|----+ <- Key=100, Value="Alice" (50 bytes)
+**        |                |        |         |
+** 3950   |----------------|        |         |
+**        | Cell 3 Data    |<-------|---------+
+**        |                |		 |
+** 4046   |----------------|		 |
+**        | Cell 2 Data    |<-------+ <- Key=200, Value="Bob" (50 bytes)
+**        |                |
+** 4096   |________________| <- End of page
+ */
 
 import (
 	"encoding/binary"
@@ -179,13 +173,9 @@ func (p *Page) writeHeader() {
 	h := p.Header
 
 	p.Data[0] = byte(h.PageType)
-
 	binary.BigEndian.PutUint16(p.Data[1:3], h.FirstFreeblock)
-
 	binary.BigEndian.PutUint16(p.Data[3:5], h.NumCells)
-
 	binary.BigEndian.PutUint16(p.Data[5:7], h.CellContentOffset)
-
 	p.Data[7] = h.FragmentedBytes
 
 	if p.Header.PageType == PageTypeInteriorTable || p.Header.PageType == PageTypeInteriorIndex {
@@ -199,13 +189,9 @@ func (p *Page) readHeader() error {
 	}
 
 	p.Header.PageType = PageType(p.Data[0])
-
 	p.Header.FirstFreeblock = binary.BigEndian.Uint16(p.Data[1:3])
-
 	p.Header.NumCells = binary.BigEndian.Uint16(p.Data[3:5])
-
 	p.Header.CellContentOffset = binary.BigEndian.Uint16(p.Data[5:7])
-
 	p.Header.FragmentedBytes = p.Data[7]
 
 	if p.Header.PageType == PageTypeInteriorTable || p.Header.PageType == PageTypeInteriorIndex {
@@ -253,9 +239,14 @@ func (p *Page) GetFreeSpace() uint16 {
 	headerSize := uint16(p.GetHeaderSize())
 	cellPtrArraySize := p.Header.NumCells * 2
 	usedAtStart := headerSize + cellPtrArraySize
+
+	if p.Header.CellContentOffset > uint16(PageSize) {
+		return 0
+	}
+
 	usedAtEnd := uint16(PageSize) - p.Header.CellContentOffset
 
-	if usedAtStart+usedAtEnd >= uint16(PageSize) {
+	if usedAtStart+usedAtEnd > uint16(PageSize) {
 		return 0
 	}
 
@@ -263,8 +254,12 @@ func (p *Page) GetFreeSpace() uint16 {
 }
 
 func (p *Page) CanFit(cellSize uint32) bool {
-
 	requiredSpace := cellSize + 2
+
+	if requiredSpace > uint32(PageSize) {
+		return false
+	}
+
 	return p.GetFreeSpace() >= uint16(requiredSpace)
 }
 
@@ -310,7 +305,7 @@ func (p *Page) InsertInteriorCell(cell *InteriorCell) error {
 	return nil
 }
 
-func (p *Page) findInsertPosition(key uint64) uint16 {
+func (p *Page) findInsertPosition(key Key) uint16 {
 	left := uint16(0)
 	right := p.Header.NumCells
 
@@ -321,7 +316,7 @@ func (p *Page) findInsertPosition(key uint64) uint16 {
 			return left
 		}
 
-		if cellKey < key {
+		if cellKey.Compare(key) < 0 {
 			left = mid + 1
 		} else {
 			right = mid
@@ -347,17 +342,28 @@ func (p *Page) insertCellPointer(position uint16, offset uint16) {
 	p.Header.NumCells++
 }
 
-func (p *Page) GetCellKey(cellNum uint16) (uint64, error) {
+func (p *Page) GetCellKey(cellNum uint16) (Key, error) {
 	cellOffset, err := p.GetCellPointer(cellNum)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	if int(cellOffset)+8 > len(p.Data) {
-		return 0, errors.New("invalid cell offset")
+		return nil, errors.New("invalid cell offset")
 	}
 
-	return binary.BigEndian.Uint64(p.Data[cellOffset : cellOffset+8]), nil
+	keyLen := binary.BigEndian.Uint32(p.Data[cellOffset : cellOffset+4])
+	if int(cellOffset)+4+int(keyLen) > len(p.Data) {
+		return nil, errors.New("key data extends beyond page")
+	}
+
+	keyData := p.Data[cellOffset+4 : cellOffset+4+uint16(keyLen)]
+	key, err := DecodeKey(keyData)
+	if err != nil {
+		return nil, err
+	}
+
+	return key, nil
 }
 
 func (p *Page) GetLeafCell(cellNum uint16) (*LeafCell, error) {
@@ -370,12 +376,22 @@ func (p *Page) GetLeafCell(cellNum uint16) (*LeafCell, error) {
 		return nil, err
 	}
 
-	if int(cellOffset)+12 > len(p.Data) {
+	if int(cellOffset)+8 > len(p.Data) {
 		return nil, errors.New("invalid cell offset")
 	}
 
-	valueLen := binary.BigEndian.Uint32(p.Data[cellOffset+8 : cellOffset+12])
-	cellSize := 12 + valueLen
+	keyLen := binary.BigEndian.Uint32(p.Data[cellOffset : cellOffset+4])
+	if int(cellOffset)+8+int(keyLen) > len(p.Data) {
+		return nil, errors.New("cell extends beyond page")
+	}
+
+	valueLen := binary.BigEndian.Uint32(p.Data[cellOffset+4+uint16(keyLen) : cellOffset+8+uint16(keyLen)])
+
+	if valueLen > uint32(len(p.Data)) {
+		return nil, errors.New("value length exceeds page size")
+	}
+
+	cellSize := 4 + keyLen + 4 + valueLen
 
 	if int(cellOffset)+int(cellSize) > len(p.Data) {
 		return nil, errors.New("cell extends beyond page")
@@ -394,14 +410,21 @@ func (p *Page) GetInteriorCell(cellNum uint16) (*InteriorCell, error) {
 		return nil, err
 	}
 
-	if int(cellOffset)+12 > len(p.Data) {
+	if int(cellOffset)+8 > len(p.Data) {
 		return nil, errors.New("invalid cell offset")
 	}
 
-	return DeserializeInteriorCell(p.Data[cellOffset : cellOffset+12])
+	keyLen := binary.BigEndian.Uint32(p.Data[cellOffset+4 : cellOffset+8])
+	cellSize := 4 + 4 + keyLen
+
+	if int(cellOffset)+int(cellSize) > len(p.Data) {
+		return nil, errors.New("cell extends beyond page")
+	}
+
+	return DeserializeInteriorCell(p.Data[cellOffset : cellOffset+uint16(cellSize)])
 }
 
-func (p *Page) SearchCell(key uint64) (uint16, bool, error) {
+func (p *Page) SearchCell(key Key) (uint16, bool, error) {
 	left := uint16(0)
 	right := p.Header.NumCells
 
@@ -412,9 +435,10 @@ func (p *Page) SearchCell(key uint64) (uint16, bool, error) {
 			return 0, false, err
 		}
 
-		if cellKey == key {
+		cmp := cellKey.Compare(key)
+		if cmp == 0 {
 			return mid, true, nil
-		} else if cellKey < key {
+		} else if cmp < 0 {
 			left = mid + 1
 		} else {
 			right = mid
@@ -424,8 +448,8 @@ func (p *Page) SearchCell(key uint64) (uint16, bool, error) {
 	return left, false, nil
 }
 
-func (p *Page) GetAllCellKeys() ([]uint64, error) {
-	keys := make([]uint64, p.Header.NumCells)
+func (p *Page) GetAllCellKeys() ([]Key, error) {
+	keys := make([]Key, p.Header.NumCells)
 	for i := uint16(0); i < p.Header.NumCells; i++ {
 		key, err := p.GetCellKey(i)
 		if err != nil {
@@ -442,7 +466,7 @@ func (p *Page) SortCells() error {
 	}
 
 	type cellPtr struct {
-		key    uint64
+		key    Key
 		offset uint16
 	}
 	pairs := make([]cellPtr, p.Header.NumCells)
@@ -460,7 +484,7 @@ func (p *Page) SortCells() error {
 	}
 
 	sort.Slice(pairs, func(i, j int) bool {
-		return pairs[i].key < pairs[j].key
+		return pairs[i].key.Compare(pairs[j].key) < 0
 	})
 
 	for i, pair := range pairs {
@@ -477,6 +501,45 @@ func (p *Page) deleteCell(cellNum uint16) error {
 		return errors.New("cell number out of range")
 	}
 
+	cellOffset, err := p.GetCellPointer(cellNum)
+	if err != nil {
+		return err
+	}
+
+	var cellSize int
+	if p.Header.PageType == PageTypeLeafTable || p.Header.PageType == PageTypeLeafIndex {
+		if int(cellOffset)+4 > len(p.Data) {
+			return errors.New("invalid cell offset")
+		}
+		keyLen := binary.BigEndian.Uint32(p.Data[cellOffset : cellOffset+4])
+
+		if int(cellOffset)+8+int(keyLen) > len(p.Data) {
+			return errors.New("invalid cell data")
+		}
+		valueLen := binary.BigEndian.Uint32(p.Data[cellOffset+4+uint16(keyLen) : cellOffset+8+uint16(keyLen)])
+
+		if valueLen > uint32(len(p.Data)) {
+			return errors.New("invalid value length")
+		}
+		cellSize = 4 + int(keyLen) + 4 + int(valueLen)
+	} else if p.Header.PageType == PageTypeInteriorTable || p.Header.PageType == PageTypeInteriorIndex {
+		if int(cellOffset)+8 > len(p.Data) {
+			return errors.New("invalid cell offset")
+		}
+		keyLen := binary.BigEndian.Uint32(p.Data[cellOffset+4 : cellOffset+8])
+		cellSize = 4 + 4 + int(keyLen)
+	} else {
+		return errors.New("unsupported page type for cell deletion")
+	}
+
+	if int(cellOffset)+cellSize > len(p.Data) {
+		return errors.New("cell extends beyond page")
+	}
+
+	for i := 0; i < cellSize; i++ {
+		p.Data[int(cellOffset)+i] = 0
+	}
+
 	ptrArrayOffset := p.GetCellPointerArrayOffset()
 
 	if cellNum < p.Header.NumCells-1 {
@@ -487,6 +550,12 @@ func (p *Page) deleteCell(cellNum uint16) error {
 	}
 
 	p.Header.NumCells--
+
+	if cellSize <= 255 {
+		p.Header.FragmentedBytes += byte(cellSize)
+	} else {
+		p.Header.FragmentedBytes = 255
+	}
 
 	p.writeHeader()
 

@@ -161,7 +161,8 @@ func isKeyword(s string) bool {
 		"SELECT", "FROM", "WHERE", "INSERT", "INTO", "VALUES",
 		"UPDATE", "SET", "DELETE", "AND", "OR", "ORDER", "BY",
 		"LIMIT", "JOIN", "ON", "AS", "CREATE", "TABLE", "DROP",
-		"INT", "PRIMARY KEY", "VARCHAR",
+		"INT", "PRIMARY", "KEY", "VARCHAR", "TEXT", "INDEX",
+		"UNIQUE",
 	}
 	upper := strings.ToUpper(s)
 	for _, kw := range keywords {

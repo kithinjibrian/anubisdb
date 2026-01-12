@@ -115,7 +115,7 @@ func fetchRawData(e *Engine, plan PlanNode) ([]map[string]interface{}, *catalog.
 }
 
 func executeInsert(e *Engine, plan *InsertPlan) (string, error) {
-	schema, err := e.catalog.GetSchema(plan.Table)
+	schema, err := e.catalog.GetTable(plan.Table)
 	if err != nil {
 		return "", fmt.Errorf("table not found: %w", err)
 	}
@@ -236,6 +236,7 @@ func executeCreateTable(e *Engine, plan *CreateTablePlan) (string, error) {
 			Type:       convertType(col.Type),
 			PrimaryKey: col.PrimaryKey,
 			NotNull:    col.NotNull,
+			Unique:     col.Unique,
 		}
 	}
 
