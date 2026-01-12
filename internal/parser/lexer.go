@@ -15,6 +15,7 @@ const (
 	STRING
 	OPERATOR
 	COMMA
+	DOT
 	SEMICOLON
 	LPAREN
 	RPAREN
@@ -105,6 +106,9 @@ func (l *Lexer) NextToken() Token {
 	case ',':
 		tok = Token{Type: COMMA, Literal: string(l.ch)}
 		l.readChar()
+	case '.':
+		tok = Token{Type: DOT, Literal: string(l.ch)}
+		l.readChar()
 	case ';':
 		tok = Token{Type: SEMICOLON, Literal: string(l.ch)}
 		l.readChar()
@@ -162,7 +166,9 @@ func isKeyword(s string) bool {
 		"UPDATE", "SET", "DELETE", "AND", "OR", "ORDER", "BY",
 		"LIMIT", "JOIN", "ON", "AS", "CREATE", "TABLE", "DROP",
 		"INT", "PRIMARY", "KEY", "VARCHAR", "TEXT", "INDEX",
-		"UNIQUE",
+		"UNIQUE", "INNER", "LEFT", "RIGHT", "FULL", "OUTER",
+		"DISTINCT", "GROUP", "HAVING", "ASC", "DESC", "OFFSET",
+		"FLOAT",
 	}
 	upper := strings.ToUpper(s)
 	for _, kw := range keywords {

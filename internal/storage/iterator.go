@@ -3,90 +3,60 @@ package storage
 import "errors"
 
 type Iterator struct {
-	btree       *BTree
+	tree        *BTree
 	currentPage uint32
-	currentCell uint16
-	done        bool
+	currentIdx  uint16
 }
 
-func (bt *BTree) NewIterator() (*Iterator, error) {
-	leftmostPage, err := bt.findLeftmostLeaf()
+func (tree *BTree) NewIterator() (*Iterator, error) {
+	leftmost, err := tree.findLeftmostLeaf()
 	if err != nil {
 		return nil, err
 	}
 
 	return &Iterator{
-		btree:       bt,
-		currentPage: leftmostPage,
-		currentCell: 0,
-		done:        false,
+		tree:        tree,
+		currentPage: leftmost,
+		currentIdx:  0,
 	}, nil
 }
 
-func (bt *BTree) findLeftmostLeaf() (uint32, error) {
-	currentPageNum := bt.rootPage
-
-	for {
-		page, err := bt.pager.ReadPage(currentPageNum)
-		if err != nil {
-			return 0, err
-		}
-
-		if isLeafPage(page) {
-			return currentPageNum, nil
-		}
-
-		if page.Header.NumCells == 0 {
-			currentPageNum = page.Header.RightmostPointer
-		} else {
-			cell, err := page.GetInteriorCell(0)
-			if err != nil {
-				return 0, err
-			}
-			currentPageNum = cell.ChildPage
-		}
-	}
-}
-
 func (it *Iterator) HasNext() bool {
-	if it.done {
+	if it.currentPage == 0 {
 		return false
 	}
 
-	page, err := it.btree.pager.ReadPage(it.currentPage)
+	page, err := it.tree.pager.ReadPage(it.currentPage)
 	if err != nil {
-		it.done = true
 		return false
 	}
 
-	return it.currentCell < page.Header.NumCells
+	return it.currentIdx < page.Header.NumCells || page.Header.NextLeaf != 0
 }
 
 func (it *Iterator) Next() (Key, []byte, error) {
-	if !it.HasNext() {
-		return nil, nil, errors.New("no more entries")
-	}
-
-	page, err := it.btree.pager.ReadPage(it.currentPage)
+	page, err := it.tree.pager.ReadPage(it.currentPage)
 	if err != nil {
-		it.done = true
 		return nil, nil, err
 	}
 
-	cell, err := page.GetLeafCell(it.currentCell)
+	if it.currentIdx >= page.Header.NumCells {
+		if page.Header.NextLeaf == 0 {
+			return nil, nil, errors.New("no more entries")
+		}
+		it.currentPage = page.Header.NextLeaf
+		it.currentIdx = 0
+		page, err = it.tree.pager.ReadPage(it.currentPage)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	cell, err := page.GetLeafCell(it.currentIdx)
 	if err != nil {
-		it.done = true
 		return nil, nil, err
 	}
 
-	key := cell.Key
-	value := cell.Value
-
-	it.currentCell++
-
-	if it.currentCell >= page.Header.NumCells {
-		it.done = true
-	}
-
-	return key, value, nil
+	it.currentIdx++
+	return cell.Key, cell.Value, nil
 }

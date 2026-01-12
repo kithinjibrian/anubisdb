@@ -6,9 +6,9 @@ import (
 )
 
 type BTree struct {
-	pager    *Pager
-	rootPage uint32
-	depth    uint32
+	pager   *Pager
+	root    uint32
+	isIndex bool
 }
 
 type Entry struct {
@@ -16,205 +16,414 @@ type Entry struct {
 	Value []byte
 }
 
-func NewBTree(pager *Pager) (*BTree, error) {
-	rootPageNum, rootPage, err := pager.AllocatePage(PageTypeLeafTable, 0)
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate root page: %w", err)
+func NewBTree(pager *Pager, isIndex bool) (*BTree, error) {
+	pageType := PageTypeLeafTable
+	if isIndex {
+		pageType = PageTypeLeafIndex
 	}
 
-	if err := pager.WritePage(rootPageNum, rootPage); err != nil {
-		return nil, fmt.Errorf("failed to write root page: %w", err)
+	rootNum, root, err := pager.AllocatePage(pageType, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	root.Header.NextLeaf = 0
+	root.Header.PrevLeaf = 0
+	root.writeHeader()
+
+	if err := pager.WritePage(rootNum, root); err != nil {
+		return nil, err
 	}
 
 	return &BTree{
-		pager:    pager,
-		rootPage: rootPageNum,
-		depth:    1,
+		pager:   pager,
+		root:    rootNum,
+		isIndex: isIndex,
 	}, nil
 }
 
-func LoadBTree(pager *Pager, rootPage uint32) (*BTree, error) {
-	depth, err := calculateDepth(pager, rootPage)
+func LoadBTree(pager *Pager, rootPage uint32, isIndex bool) (*BTree, error) {
+	if rootPage == 0 {
+		return nil, errors.New("invalid root page number")
+	}
+
+	root, err := pager.ReadPage(rootPage)
 	if err != nil {
-		return nil, fmt.Errorf("failed to calculate tree depth: %w", err)
+		return nil, fmt.Errorf("failed to load root page: %w", err)
+	}
+
+	expectedLeafType := PageTypeLeafTable
+	expectedInteriorType := PageTypeInteriorTable
+	if isIndex {
+		expectedLeafType = PageTypeLeafIndex
+		expectedInteriorType = PageTypeInteriorIndex
+	}
+
+	if root.Header.PageType != expectedLeafType && root.Header.PageType != expectedInteriorType {
+		return nil, fmt.Errorf("root page has incorrect type: %d", root.Header.PageType)
 	}
 
 	return &BTree{
-		pager:    pager,
-		rootPage: rootPage,
-		depth:    depth,
+		pager:   pager,
+		root:    rootPage,
+		isIndex: isIndex,
 	}, nil
 }
 
-func calculateDepth(pager *Pager, rootPage uint32) (uint32, error) {
-	depth := uint32(1)
-	currentPageNum := rootPage
-
-	for {
-		page, err := pager.ReadPage(currentPageNum)
-		if err != nil {
-			return 0, err
-		}
-
-		if isLeafPage(page) {
-			return depth, nil
-		}
-
-		currentPageNum, err = getLeftmostChild(page)
-		if err != nil {
-			return 0, err
-		}
-
-		depth++
+func (tree *BTree) getLeafPageType() PageType {
+	if tree.isIndex {
+		return PageTypeLeafIndex
 	}
+	return PageTypeLeafTable
 }
 
-func isLeafPage(page *Page) bool {
-	return page.Header.PageType == PageTypeLeafTable ||
-		page.Header.PageType == PageTypeLeafIndex
+func (tree *BTree) getInteriorPageType() PageType {
+	if tree.isIndex {
+		return PageTypeInteriorIndex
+	}
+	return PageTypeInteriorTable
 }
 
-func getLeftmostChild(page *Page) (uint32, error) {
-	if page.Header.NumCells == 0 {
-		return page.Header.RightmostPointer, nil
+func (tree *BTree) Search(key Key) ([]byte, error) {
+	leafNum, err := tree.navigateToLeaf(tree.root, key)
+	if err != nil {
+		return nil, err
 	}
 
-	cell, err := page.GetInteriorCell(0)
+	leaf, err := tree.pager.ReadPage(leafNum)
 	if err != nil {
-		return 0, err
-	}
-	return cell.ChildPage, nil
-}
-
-func (bt *BTree) Search(key Key) ([]byte, error) {
-	leafPageNum, err := bt.findLeafPage(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find leaf page: %w", err)
+		return nil, err
 	}
 
-	leafPage, err := bt.pager.ReadPage(leafPageNum)
+	idx, found, err := leaf.SearchCell(key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read leaf page: %w", err)
-	}
-
-	cellNum, found, err := leafPage.SearchCell(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to search cell: %w", err)
+		return nil, err
 	}
 
 	if !found {
 		return nil, errors.New("key not found")
 	}
 
-	cell, err := leafPage.GetLeafCell(cellNum)
+	cell, err := leaf.GetLeafCell(idx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get leaf cell: %w", err)
+		return nil, err
 	}
 
 	return cell.Value, nil
 }
 
-func (bt *BTree) findLeafPage(key Key) (uint32, error) {
-	currentPageNum := bt.rootPage
-
-	for {
-		page, err := bt.pager.ReadPage(currentPageNum)
-		if err != nil {
-			return 0, err
-		}
-
-		if isLeafPage(page) {
-			return currentPageNum, nil
-		}
-
-		childPageNum, err := bt.findChildPageForKey(page, key)
-		if err != nil {
-			return 0, err
-		}
-
-		currentPageNum = childPageNum
+func (tree *BTree) navigateToLeaf(nodeNum uint32, key Key) (uint32, error) {
+	node, err := tree.pager.ReadPage(nodeNum)
+	if err != nil {
+		return 0, err
 	}
+
+	if isLeaf(node.Header.PageType) {
+		return nodeNum, nil
+	}
+
+	childNum, err := tree.findChild(node, key)
+	if err != nil {
+		return 0, err
+	}
+
+	return tree.navigateToLeaf(childNum, key)
 }
 
-func (bt *BTree) findChildPageForKey(page *Page, key Key) (uint32, error) {
-	if page.Header.NumCells == 0 {
-		return page.Header.RightmostPointer, nil
-	}
-
-	for i := uint16(0); i < page.Header.NumCells; i++ {
-		cellKey, err := page.GetCellKey(i)
+func (tree *BTree) findChild(node *Page, key Key) (uint32, error) {
+	for i := uint16(0); i < node.Header.NumCells; i++ {
+		cellKey, err := node.GetCellKey(i)
 		if err != nil {
-			return 0, err
+			return 0, fmt.Errorf("failed to get cell key: %w", err)
 		}
 
 		if key.Compare(cellKey) < 0 {
-			cell, err := page.GetInteriorCell(i)
+			cell, err := node.GetInteriorCell(i)
 			if err != nil {
-				return 0, err
+				return 0, fmt.Errorf("failed to get interior cell: %w", err)
 			}
 			return cell.ChildPage, nil
 		}
 	}
 
-	return page.Header.RightmostPointer, nil
+	return node.Header.RightmostPointer, nil
 }
 
-func (bt *BTree) Insert(key Key, value []byte) error {
-	leafPageNum, err := bt.findLeafPage(key)
+func (tree *BTree) Insert(key Key, value []byte) error {
+	path := make([]*pathNode, 0)
+	leafNum, err := tree.navigateWithPath(tree.root, key, &path)
 	if err != nil {
-		return fmt.Errorf("failed to find leaf page: %w", err)
+		return err
 	}
 
-	leafPage, err := bt.pager.ReadPage(leafPageNum)
+	leaf, err := tree.pager.ReadPage(leafNum)
 	if err != nil {
-		return fmt.Errorf("failed to read leaf page: %w", err)
+		return err
 	}
 
-	if _, found, _ := leafPage.SearchCell(key); found {
-		return fmt.Errorf("key already exists")
+	if _, found, _ := leaf.SearchCell(key); found {
+		return errors.New("duplicate key")
 	}
 
 	cell := NewLeafCell(key, value)
 
-	if leafPage.CanFit(cell.Size()) {
-		if err := leafPage.InsertLeafCell(cell); err != nil {
-			return fmt.Errorf("failed to insert leaf cell: %w", err)
+	if leaf.CanFit(cell.Size()) {
+		if err := leaf.InsertLeafCell(cell); err != nil {
+			return err
 		}
-		return bt.pager.WritePage(leafPageNum, leafPage)
+		return tree.pager.WritePage(leafNum, leaf)
 	}
 
-	return bt.handleLeafPageSplit(leafPageNum, leafPage, cell)
+	return tree.insertAndSplit(leafNum, leaf, cell, path)
 }
 
-func (bt *BTree) Update(key Key, newValue []byte) error {
-	_, err := bt.Search(key)
+type pathNode struct {
+	pageNum uint32
+	page    *Page
+}
+
+func (tree *BTree) navigateWithPath(nodeNum uint32, key Key, path *[]*pathNode) (uint32, error) {
+	node, err := tree.pager.ReadPage(nodeNum)
 	if err != nil {
-		return fmt.Errorf("key not found: %w", err)
+		return 0, err
 	}
 
-	if err := bt.Delete(key); err != nil {
-		return fmt.Errorf("failed to delete old entry: %w", err)
+	if isLeaf(node.Header.PageType) {
+		return nodeNum, nil
 	}
 
-	if err := bt.Insert(key, newValue); err != nil {
-		return fmt.Errorf("failed to insert new entry: %w", err)
+	*path = append(*path, &pathNode{pageNum: nodeNum, page: node})
+
+	childNum, err := tree.findChild(node, key)
+	if err != nil {
+		return 0, err
 	}
 
+	return tree.navigateWithPath(childNum, key, path)
+}
+
+func (tree *BTree) insertAndSplit(leafNum uint32, leaf *Page, newCell *LeafCell, path []*pathNode) error {
+	cells := make([]*LeafCell, 0, leaf.Header.NumCells+1)
+
+	for i := uint16(0); i < leaf.Header.NumCells; i++ {
+		c, err := leaf.GetLeafCell(i)
+		if err != nil {
+			return fmt.Errorf("failed to get leaf cell during split: %w", err)
+		}
+		cells = append(cells, c)
+	}
+	cells = append(cells, newCell)
+
+	tree.sortLeafCells(cells)
+
+	mid := len(cells) / 2
+
+	if mid == 0 {
+		mid = 1
+	}
+	if mid >= len(cells) {
+		mid = len(cells) - 1
+	}
+
+	siblingNum, sibling, err := tree.pager.AllocatePage(tree.getLeafPageType(), 0)
+	if err != nil {
+		return err
+	}
+
+	tree.resetPage(leaf)
+	tree.resetPage(sibling)
+
+	for i := 0; i < mid; i++ {
+		if err := leaf.InsertLeafCell(cells[i]); err != nil {
+			return fmt.Errorf("failed to insert cell into left leaf: %w", err)
+		}
+	}
+
+	for i := mid; i < len(cells); i++ {
+		if err := sibling.InsertLeafCell(cells[i]); err != nil {
+			return fmt.Errorf("failed to insert cell into right leaf: %w", err)
+		}
+	}
+
+	sibling.Header.NextLeaf = leaf.Header.NextLeaf
+	sibling.Header.PrevLeaf = leafNum
+	leaf.Header.NextLeaf = siblingNum
+
+	if sibling.Header.NextLeaf != 0 {
+		next, err := tree.pager.ReadPage(sibling.Header.NextLeaf)
+		if err != nil {
+			return fmt.Errorf("failed to read next leaf during split: %w", err)
+		}
+		next.Header.PrevLeaf = siblingNum
+		next.writeHeader()
+		if err := tree.pager.WritePage(sibling.Header.NextLeaf, next); err != nil {
+			return fmt.Errorf("failed to update next leaf pointer: %w", err)
+		}
+	}
+
+	leaf.writeHeader()
+	sibling.writeHeader()
+
+	if err := tree.pager.WritePage(leafNum, leaf); err != nil {
+		return err
+	}
+	if err := tree.pager.WritePage(siblingNum, sibling); err != nil {
+		return err
+	}
+
+	splitKey := cells[mid].Key
+
+	return tree.insertIntoParent(leafNum, splitKey, siblingNum, path)
+}
+
+func (tree *BTree) sortLeafCells(cells []*LeafCell) {
+
+	for i := 1; i < len(cells); i++ {
+		j := i
+		for j > 0 && cells[j].Key.Compare(cells[j-1].Key) < 0 {
+			cells[j], cells[j-1] = cells[j-1], cells[j]
+			j--
+		}
+	}
+}
+
+func (tree *BTree) sortInternalCells(cells []*InteriorCell) {
+
+	for i := 1; i < len(cells); i++ {
+		j := i
+		for j > 0 && cells[j].Key.Compare(cells[j-1].Key) < 0 {
+			cells[j], cells[j-1] = cells[j-1], cells[j]
+			j--
+		}
+	}
+}
+
+func (tree *BTree) resetPage(page *Page) {
+	offset := page.GetHeaderSize()
+
+	for i := offset; i < len(page.Data); i++ {
+		page.Data[i] = 0
+	}
+	page.Header.NumCells = 0
+	page.Header.CellContentOffset = uint16(PageSize)
+	page.Header.FragmentedBytes = 0
+	page.writeHeader()
+}
+
+func (tree *BTree) insertIntoParent(leftChild uint32, splitKey Key, rightChild uint32, path []*pathNode) error {
+	if len(path) == 0 {
+		return tree.createNewRoot(leftChild, splitKey, rightChild)
+	}
+
+	parent := path[len(path)-1]
+	path = path[:len(path)-1]
+
+	cell := NewInteriorCell(splitKey, leftChild)
+
+	if parent.page.CanFit(cell.Size()) {
+		if err := parent.page.InsertInteriorCell(cell); err != nil {
+			return err
+		}
+		return tree.pager.WritePage(parent.pageNum, parent.page)
+	}
+
+	return tree.splitInternalNode(parent.pageNum, parent.page, cell, path)
+}
+
+func (tree *BTree) splitInternalNode(nodeNum uint32, node *Page, newCell *InteriorCell, path []*pathNode) error {
+	cells := make([]*InteriorCell, 0, node.Header.NumCells+1)
+
+	for i := uint16(0); i < node.Header.NumCells; i++ {
+		c, err := node.GetInteriorCell(i)
+		if err != nil {
+			return fmt.Errorf("failed to get interior cell during split: %w", err)
+		}
+		cells = append(cells, c)
+	}
+	cells = append(cells, newCell)
+
+	tree.sortInternalCells(cells)
+
+	mid := len(cells) / 2
+
+	if mid == 0 {
+		mid = 1
+	}
+	if mid >= len(cells) {
+		mid = len(cells) - 1
+	}
+
+	siblingNum, sibling, err := tree.pager.AllocatePage(tree.getInteriorPageType(), 0)
+	if err != nil {
+		return err
+	}
+
+	tree.resetPage(node)
+	tree.resetPage(sibling)
+
+	for i := 0; i < mid; i++ {
+		if err := node.InsertInteriorCell(cells[i]); err != nil {
+			return fmt.Errorf("failed to insert cell into left interior: %w", err)
+		}
+	}
+
+	pushUpKey := cells[mid].Key
+
+	for i := mid + 1; i < len(cells); i++ {
+		if err := sibling.InsertInteriorCell(cells[i]); err != nil {
+			return fmt.Errorf("failed to insert cell into right interior: %w", err)
+		}
+	}
+
+	sibling.Header.RightmostPointer = node.Header.RightmostPointer
+	node.Header.RightmostPointer = cells[mid].ChildPage
+
+	node.writeHeader()
+	sibling.writeHeader()
+
+	if err := tree.pager.WritePage(nodeNum, node); err != nil {
+		return err
+	}
+	if err := tree.pager.WritePage(siblingNum, sibling); err != nil {
+		return err
+	}
+
+	return tree.insertIntoParent(nodeNum, pushUpKey, siblingNum, path)
+}
+
+func (tree *BTree) createNewRoot(leftChild uint32, key Key, rightChild uint32) error {
+	newRootNum, newRoot, err := tree.pager.AllocatePage(tree.getInteriorPageType(), 0)
+	if err != nil {
+		return err
+	}
+
+	cell := NewInteriorCell(key, leftChild)
+	if err := newRoot.InsertInteriorCell(cell); err != nil {
+		return err
+	}
+	newRoot.Header.RightmostPointer = rightChild
+	newRoot.writeHeader()
+
+	if err := tree.pager.WritePage(newRootNum, newRoot); err != nil {
+		return err
+	}
+
+	tree.root = newRootNum
 	return nil
 }
 
-func (bt *BTree) Delete(key Key) error {
-	leafPageNum, err := bt.findLeafPage(key)
+func (tree *BTree) Delete(key Key) error {
+	leafNum, err := tree.navigateToLeaf(tree.root, key)
 	if err != nil {
 		return err
 	}
 
-	leafPage, err := bt.pager.ReadPage(leafPageNum)
+	leaf, err := tree.pager.ReadPage(leafNum)
 	if err != nil {
 		return err
 	}
 
-	cellNum, found, err := leafPage.SearchCell(key)
+	idx, found, err := leaf.SearchCell(key)
 	if err != nil {
 		return err
 	}
@@ -223,138 +432,274 @@ func (bt *BTree) Delete(key Key) error {
 		return errors.New("key not found")
 	}
 
-	if err := leafPage.deleteCell(cellNum); err != nil {
+	if err := leaf.deleteCell(idx); err != nil {
 		return err
 	}
 
-	if err := bt.pager.WritePage(leafPageNum, leafPage); err != nil {
+	if err := tree.pager.WritePage(leafNum, leaf); err != nil {
 		return err
 	}
+
+	// TODO: Implement underflow handling (merge/redistribute)
+	// For now, we allow nodes to become sparse
 
 	return nil
 }
 
-func (bt *BTree) handleLeafPageSplit(oldPageNum uint32, oldPage *Page, newCell *LeafCell) error {
-	newPageNum, newPage, err := bt.pager.AllocatePage(PageTypeLeafTable, 0)
+func (tree *BTree) Update(key Key, newValue []byte) error {
+	leafNum, err := tree.navigateToLeaf(tree.root, key)
 	if err != nil {
-		return fmt.Errorf("failed to allocate new page: %w", err)
-	}
-
-	allCells, err := bt.collectAndSortCells(oldPage, newCell)
-	if err != nil {
-		return fmt.Errorf("failed to collect cells: %w", err)
-	}
-
-	splitPoint := len(allCells) / 2
-
-	if err := bt.distributeCells(oldPage, newPage, allCells, splitPoint); err != nil {
-		return fmt.Errorf("failed to distribute cells: %w", err)
-	}
-
-	promoteKey := allCells[splitPoint].Key
-
-	if err := bt.pager.WritePage(oldPageNum, oldPage); err != nil {
-		return err
-	}
-	if err := bt.pager.WritePage(newPageNum, newPage); err != nil {
 		return err
 	}
 
-	if oldPageNum == bt.rootPage {
-		return bt.createNewRoot(oldPageNum, promoteKey, newPageNum)
+	leaf, err := tree.pager.ReadPage(leafNum)
+	if err != nil {
+		return err
 	}
 
-	return bt.createNewRoot(oldPageNum, promoteKey, newPageNum)
-}
+	idx, found, err := leaf.SearchCell(key)
+	if err != nil {
+		return err
+	}
 
-func (bt *BTree) collectAndSortCells(page *Page, newCell *LeafCell) ([]*LeafCell, error) {
-	allCells := make([]*LeafCell, 0, page.Header.NumCells+1)
+	if !found {
+		return errors.New("key not found")
+	}
 
-	for i := uint16(0); i < page.Header.NumCells; i++ {
-		cell, err := page.GetLeafCell(i)
+	oldCell, err := leaf.GetLeafCell(idx)
+	if err != nil {
+		return err
+	}
+
+	newCell := NewLeafCell(key, newValue)
+
+	if newCell.Size() <= oldCell.Size() || leaf.CanFit(newCell.Size()) {
+
+		if err := leaf.deleteCell(idx); err != nil {
+			return err
+		}
+
+		if err := leaf.InsertLeafCell(newCell); err != nil {
+			return err
+		}
+
+		return tree.pager.WritePage(leafNum, leaf)
+	}
+
+	if err := leaf.deleteCell(idx); err != nil {
+		return err
+	}
+
+	if err := leaf.InsertLeafCell(newCell); err != nil {
+
+		leaf, err = tree.pager.ReadPage(leafNum)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		allCells = append(allCells, cell)
+
+		path := make([]*pathNode, 0)
+		leafNum, err = tree.navigateWithPath(tree.root, key, &path)
+		if err != nil {
+			return err
+		}
+
+		leaf, err = tree.pager.ReadPage(leafNum)
+		if err != nil {
+			return err
+		}
+
+		return tree.insertAndSplit(leafNum, leaf, newCell, path)
 	}
 
-	allCells = append(allCells, newCell)
-
-	for i := 1; i < len(allCells); i++ {
-		j := i
-		for j > 0 && allCells[j].Key.Compare(allCells[j-1].Key) < 0 {
-			allCells[j], allCells[j-1] = allCells[j-1], allCells[j]
-			j--
-		}
-	}
-
-	return allCells, nil
+	return tree.pager.WritePage(leafNum, leaf)
 }
 
-func (bt *BTree) distributeCells(oldPage, newPage *Page, cells []*LeafCell, splitPoint int) error {
-	headerSize := oldPage.GetHeaderSize()
-	for i := headerSize; i < len(oldPage.Data); i++ {
-		oldPage.Data[i] = 0
-	}
-	
-	oldPage.Header.NumCells = 0
-	oldPage.Header.CellContentOffset = uint16(PageSize)
-	oldPage.Header.FragmentedBytes = 0
-	oldPage.writeHeader()
-
-	for i := 0; i < splitPoint; i++ {
-		if err := oldPage.InsertLeafCell(cells[i]); err != nil {
-			return fmt.Errorf("failed to insert into old page: %w", err)
-		}
-	}
-
-	for i := splitPoint; i < len(cells); i++ {
-		if err := newPage.InsertLeafCell(cells[i]); err != nil {
-			return fmt.Errorf("failed to insert into new page: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (bt *BTree) createNewRoot(leftChild uint32, key Key, rightChild uint32) error {
-	newRootNum, newRoot, err := bt.pager.AllocatePage(PageTypeInteriorTable, 0)
+func (tree *BTree) Scan() ([]Entry, error) {
+	leftmost, err := tree.findLeftmostLeaf()
 	if err != nil {
-		return fmt.Errorf("failed to allocate new root: %w", err)
+		return nil, err
 	}
 
-	newRoot.Header.RightmostPointer = rightChild
+	var result []Entry
+	currentNum := leftmost
 
-	leftCell := NewInteriorCell(key, leftChild)
-	if err := newRoot.InsertInteriorCell(leftCell); err != nil {
-		return fmt.Errorf("failed to insert into new root: %w", err)
+	visited := make(map[uint32]bool)
+
+	for currentNum != 0 {
+		if visited[currentNum] {
+			return nil, fmt.Errorf("circular reference detected in leaf chain at page %d", currentNum)
+		}
+		visited[currentNum] = true
+
+		current, err := tree.pager.ReadPage(currentNum)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read page %d during scan: %w", currentNum, err)
+		}
+
+		for i := uint16(0); i < current.Header.NumCells; i++ {
+			cell, err := current.GetLeafCell(i)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read cell %d from page %d: %w", i, currentNum, err)
+			}
+
+			result = append(result, Entry{
+				Key:   cell.Key,
+				Value: cell.Value,
+			})
+		}
+
+		currentNum = current.Header.NextLeaf
 	}
 
-	if err := bt.pager.WritePage(newRootNum, newRoot); err != nil {
-		return fmt.Errorf("failed to write new root: %w", err)
+	return result, nil
+}
+
+func (tree *BTree) findLeftmostLeaf() (uint32, error) {
+	currentNum := tree.root
+
+	for {
+		current, err := tree.pager.ReadPage(currentNum)
+		if err != nil {
+			return 0, err
+		}
+
+		if isLeaf(current.Header.PageType) {
+			return currentNum, nil
+		}
+
+		if current.Header.NumCells > 0 {
+			cell, err := current.GetInteriorCell(0)
+			if err != nil {
+				return 0, fmt.Errorf("failed to get first interior cell: %w", err)
+			}
+			currentNum = cell.ChildPage
+		} else {
+			currentNum = current.Header.RightmostPointer
+		}
+
+		if currentNum == 0 {
+			return 0, errors.New("invalid child pointer (0) encountered")
+		}
+	}
+}
+
+func (tree *BTree) RangeSearch(start, end Key) ([]Entry, error) {
+	leafNum, err := tree.navigateToLeaf(tree.root, start)
+	if err != nil {
+		return nil, err
 	}
 
-	bt.rootPage = newRootNum
-	bt.depth++
+	var result []Entry
+	currentNum := leafNum
+	visited := make(map[uint32]bool)
 
+	for currentNum != 0 {
+		if visited[currentNum] {
+			return nil, fmt.Errorf("circular reference detected in leaf chain at page %d", currentNum)
+		}
+		visited[currentNum] = true
+
+		current, err := tree.pager.ReadPage(currentNum)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read page %d during range search: %w", currentNum, err)
+		}
+
+		for i := uint16(0); i < current.Header.NumCells; i++ {
+			cell, err := current.GetLeafCell(i)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read cell %d from page %d: %w", i, currentNum, err)
+			}
+
+			if cell.Key.Compare(start) < 0 {
+				continue
+			}
+
+			if cell.Key.Compare(end) > 0 {
+				return result, nil
+			}
+
+			result = append(result, Entry{
+				Key:   cell.Key,
+				Value: cell.Value,
+			})
+		}
+
+		currentNum = current.Header.NextLeaf
+	}
+
+	return result, nil
+}
+
+func (tree *BTree) GetAllEntries() ([]Entry, error) {
+	return tree.Scan()
+}
+
+func (tree *BTree) Count() (int, error) {
+	entries, err := tree.Scan()
+	if err != nil {
+		return 0, err
+	}
+	return len(entries), nil
+}
+
+func (tree *BTree) ForEach(fn func(key Key, value []byte) bool) error {
+	entries, err := tree.Scan()
+	if err != nil {
+		return err
+	}
+
+	for _, e := range entries {
+		if !fn(e.Key, e.Value) {
+			break
+		}
+	}
 	return nil
 }
 
-func (bt *BTree) GetRootPage() uint32 {
-	return bt.rootPage
+func (tree *BTree) GetRootPage() uint32 {
+	return tree.root
 }
 
-func (bt *BTree) GetDepth() uint32 {
-	return bt.depth
+func (tree *BTree) GetDepth() (uint32, error) {
+	depth := uint32(0)
+	currentNum := tree.root
+
+	for {
+		current, err := tree.pager.ReadPage(currentNum)
+		if err != nil {
+			return 0, err
+		}
+
+		depth++
+
+		if isLeaf(current.Header.PageType) {
+			return depth, nil
+		}
+
+		if current.Header.NumCells > 0 {
+			cell, err := current.GetInteriorCell(0)
+			if err != nil {
+				return 0, fmt.Errorf("failed to get interior cell: %w", err)
+			}
+			currentNum = cell.ChildPage
+		} else {
+			currentNum = current.Header.RightmostPointer
+		}
+
+		if currentNum == 0 {
+			return 0, errors.New("invalid child pointer encountered")
+		}
+	}
 }
 
-func (bt *BTree) PrintTree() error {
-	fmt.Printf("B+ Tree (root=%d, depth=%d)\n", bt.rootPage, bt.depth)
-	return bt.printPage(bt.rootPage, 0)
+func (tree *BTree) PrintTree() error {
+	depth, _ := tree.GetDepth()
+	fmt.Printf("B+ Tree (root=%d, depth=%d)\n", tree.root, depth)
+	return tree.printNode(tree.root, 0)
 }
 
-func (bt *BTree) printPage(pageNum uint32, level int) error {
-	page, err := bt.pager.ReadPage(pageNum)
+func (tree *BTree) printNode(nodeNum uint32, level int) error {
+	node, err := tree.pager.ReadPage(nodeNum)
 	if err != nil {
 		return err
 	}
@@ -364,136 +709,25 @@ func (bt *BTree) printPage(pageNum uint32, level int) error {
 		indent += "  "
 	}
 
-	if isLeafPage(page) {
-		fmt.Printf("%sLeaf Page %d: %d cells\n", indent, pageNum, page.Header.NumCells)
-		keys, _ := page.GetAllCellKeys()
-		fmt.Printf("%s  Keys: ", indent)
-		for i, k := range keys {
-			if i > 0 {
-				fmt.Printf(", ")
-			}
-			fmt.Printf("%s", k.String())
+	if isLeaf(node.Header.PageType) {
+		fmt.Printf("%sLEAF[%d] cells=%d next=%d\n",
+			indent, nodeNum, node.Header.NumCells, node.Header.NextLeaf)
+
+		for i := uint16(0); i < node.Header.NumCells; i++ {
+			cell, _ := node.GetLeafCell(i)
+			fmt.Printf("%s  %s = %v\n", indent, cell.Key.String(), cell.Value)
 		}
-		fmt.Println()
 	} else {
-		fmt.Printf("%sInterior Page %d: %d cells, rightmost=%d\n",
-			indent, pageNum, page.Header.NumCells, page.Header.RightmostPointer)
+		fmt.Printf("%sINTERNAL[%d] cells=%d\n", indent, nodeNum, node.Header.NumCells)
 
-		for i := uint16(0); i < page.Header.NumCells; i++ {
-			cell, err := page.GetInteriorCell(i)
-			if err != nil {
-				return err
-			}
-			fmt.Printf("%s  Cell %d: key=%s -> page %d\n", indent, i, cell.Key.String(), cell.ChildPage)
-			if err := bt.printPage(cell.ChildPage, level+1); err != nil {
-				return err
-			}
+		for i := uint16(0); i < node.Header.NumCells; i++ {
+			cell, _ := node.GetInteriorCell(i)
+			fmt.Printf("%s  [%s] -> %d\n", indent, cell.Key.String(), cell.ChildPage)
+			tree.printNode(cell.ChildPage, level+1)
 		}
 
-		fmt.Printf("%s  Rightmost -> page %d\n", indent, page.Header.RightmostPointer)
-		if err := bt.printPage(page.Header.RightmostPointer, level+1); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (bt *BTree) Scan() ([]Entry, error) {
-	var entries []Entry
-
-	rootPage, err := bt.pager.ReadPage(bt.rootPage)
-	if err != nil {
-		return nil, err
-	}
-
-	if rootPage.Header.PageType == PageTypeLeafTable ||
-		rootPage.Header.PageType == PageTypeLeafIndex {
-		for i := uint16(0); i < rootPage.Header.NumCells; i++ {
-			cell, err := rootPage.GetLeafCell(i)
-			if err != nil {
-				return nil, err
-			}
-			entries = append(entries, Entry{
-				Key:   cell.Key,
-				Value: cell.Value,
-			})
-		}
-		return entries, nil
-	}
-
-	it, err := bt.NewIterator()
-	if err != nil {
-		return nil, err
-	}
-
-	visited := make(map[uint32]bool)
-	maxIterations := 100000
-	iterations := 0
-
-	for it.HasNext() {
-		iterations++
-		if iterations > maxIterations {
-			return nil, fmt.Errorf("infinite loop detected after %d iterations", iterations)
-		}
-
-		if visited[it.currentPage] && it.currentCell == 0 {
-			break
-		}
-		visited[it.currentPage] = true
-
-		key, value, err := it.Next()
-		if err != nil {
-			break
-		}
-
-		entries = append(entries, Entry{
-			Key:   key,
-			Value: value,
-		})
-	}
-
-	return entries, nil
-}
-
-func (bt *BTree) GetAllEntries() ([]Entry, error) {
-	return bt.Scan()
-}
-
-func (bt *BTree) Count() (int, error) {
-	count := 0
-
-	it, err := bt.NewIterator()
-	if err != nil {
-		return 0, err
-	}
-
-	for it.HasNext() {
-		_, _, err := it.Next()
-		if err != nil {
-			break
-		}
-		count++
-	}
-
-	return count, nil
-}
-
-func (bt *BTree) ForEach(fn func(key Key, value []byte) bool) error {
-	it, err := bt.NewIterator()
-	if err != nil {
-		return err
-	}
-
-	for it.HasNext() {
-		key, value, err := it.Next()
-		if err != nil {
-			break
-		}
-
-		if !fn(key, value) {
-			break
-		}
+		fmt.Printf("%s  [*] -> %d\n", indent, node.Header.RightmostPointer)
+		tree.printNode(node.Header.RightmostPointer, level+1)
 	}
 
 	return nil

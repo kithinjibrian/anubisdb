@@ -8,7 +8,12 @@ import (
 	"github.com/kithinjibrian/anubisdb/internal/storage"
 )
 
-const SystemTableName = "anubis_schema"
+const SystemCatalogTable = "anubis_catalog"
+
+const (
+	MaxCachedTables  = 100
+	MaxCachedIndexes = 500
+)
 
 type ColumnType string
 
@@ -20,508 +25,395 @@ const (
 )
 
 type Column struct {
-	Name       string
-	Type       ColumnType
-	PrimaryKey bool
-	NotNull    bool
-	Unique     bool
+	Name       string     `json:"name"`
+	Type       ColumnType `json:"type"`
+	PrimaryKey bool       `json:"primary_key"`
+	NotNull    bool       `json:"not_null"`
+	Unique     bool       `json:"unique"`
 }
 
 type Schema struct {
-	Name     string
-	Columns  []Column
-	RootPage uint32
-}
-
-func (s *Schema) ColumnCount() int {
-	return len(s.Columns)
-}
-
-func (s *Schema) GetColumn(name string) (*Column, error) {
-	for i := range s.Columns {
-		if s.Columns[i].Name == name {
-			return &s.Columns[i], nil
-		}
-	}
-	return nil, fmt.Errorf("column '%s' not found", name)
+	Name     string   `json:"name"`
+	Columns  []Column `json:"columns"`
+	RootPage uint32   `json:"root_page"`
+	Version  int      `json:"version"`
 }
 
 type IndexMetadata struct {
-	Name       string
-	TableName  string
-	ColumnName string
-	IsUnique   bool
-	RootPage   uint32
-}
-
-type catalogEntry struct {
-	Type        string `json:"type"`
-	Name        string `json:"name"`
-	TblName     string `json:"tbl_name"`
-	RootPage    uint32 `json:"rootpage"`
-	Columns     string `json:"columns,omitempty"`
-	IndexColumn string `json:"index_column,omitempty"`
-	IsUnique    bool   `json:"is_unique,omitempty"`
+	Name       string `json:"name"`
+	TableName  string `json:"table_name"`
+	ColumnName string `json:"column_name"`
+	Unique     bool   `json:"unique"`
+	RootPage   uint32 `json:"root_page"`
 }
 
 type Catalog struct {
-	pager       *storage.Pager
-	schemas     map[string]*Schema
-	indexes     map[string]*IndexMetadata
-	systemBTree *storage.BTree
-	nextEntryID uint64
+	pager *storage.Pager
+	tree  *storage.BTree
+
+	tableCache *lruCache
+	indexCache *lruCache
+}
+
+type metadataEntry struct {
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data"`
 }
 
 func NewCatalog(pager *storage.Pager) (*Catalog, error) {
-	c := &Catalog{
-		pager:       pager,
-		schemas:     make(map[string]*Schema),
-		indexes:     make(map[string]*IndexMetadata),
-		nextEntryID: 1,
+	cat := &Catalog{
+		pager:      pager,
+		tableCache: newLRUCache(MaxCachedTables),
+		indexCache: newLRUCache(MaxCachedIndexes),
 	}
 
-	if err := c.loadSystemCatalog(); err != nil {
+	if pager.GetNumPages() == 0 {
+		return cat.initialize()
+	}
 
-		if err := c.initializeSystemCatalog(); err != nil {
-			return nil, fmt.Errorf("failed to initialize system catalog: %w", err)
-		}
+	tree, err := storage.LoadBTree(pager, 1, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load catalog: %w", err)
+	}
+
+	cat.tree = tree
+
+	if err := cat.verifyCatalog(); err != nil {
+		return nil, fmt.Errorf("catalog verification failed: %w", err)
+	}
+
+	return cat, nil
+}
+
+func (c *Catalog) initialize() (*Catalog, error) {
+	tree, err := storage.NewBTree(c.pager, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create catalog tree: %w", err)
+	}
+	c.tree = tree
+
+	catalogSchema := &Schema{
+		Name: SystemCatalogTable,
+		Columns: []Column{
+			{Name: "entry_type", Type: TypeText, NotNull: true},
+			{Name: "name", Type: TypeText, NotNull: true, PrimaryKey: true},
+			{Name: "metadata", Type: TypeText, NotNull: true},
+		},
+		RootPage: tree.GetRootPage(),
+		Version:  1,
+	}
+
+	c.tableCache.Put(SystemCatalogTable, catalogSchema)
+
+	if err := c.saveTable(catalogSchema); err != nil {
+		return nil, fmt.Errorf("failed to save catalog schema: %w", err)
 	}
 
 	return c, nil
 }
 
-func (c *Catalog) initializeSystemCatalog() error {
-
-	btree, err := storage.NewBTree(c.pager)
-	if err != nil {
-		return fmt.Errorf("failed to create system B-tree: %w", err)
-	}
-	c.systemBTree = btree
-
-	systemSchema := &Schema{
-		Name: SystemTableName,
-		Columns: []Column{
-			{Name: "type", Type: TypeText, NotNull: true},
-			{Name: "name", Type: TypeText, NotNull: true},
-			{Name: "tbl_name", Type: TypeText, NotNull: true},
-			{Name: "rootpage", Type: TypeInt, NotNull: true},
-			{Name: "columns", Type: TypeText},
-			{Name: "index_column", Type: TypeText},
-			{Name: "is_unique", Type: TypeBoolean},
-		},
-		RootPage: btree.GetRootPage(),
-	}
-	c.schemas[SystemTableName] = systemSchema
-
-	columnsJSON, err := json.Marshal(systemSchema.Columns)
-	if err != nil {
-		return fmt.Errorf("failed to marshal system columns: %w", err)
-	}
-
-	entry := catalogEntry{
-		Type:     "table",
-		Name:     SystemTableName,
-		TblName:  SystemTableName,
-		RootPage: systemSchema.RootPage,
-		Columns:  string(columnsJSON),
-	}
-
-	if err := c.insertEntry(entry); err != nil {
-		return fmt.Errorf("failed to insert system catalog entry: %w", err)
-	}
-
-	return nil
-}
-
-func (c *Catalog) loadSystemCatalog() error {
-
-	btree, err := storage.LoadBTree(c.pager, 0)
+func (c *Catalog) verifyCatalog() error {
+	count, err := c.tree.Count()
 	if err != nil {
 		return err
 	}
-	c.systemBTree = btree
 
-	entries, err := c.systemBTree.Scan()
+	if count == 0 {
+		return errors.New("catalog is empty")
+	}
+
+	return nil
+}
+
+func (c *Catalog) loadTableFromDisk(name string) (*Schema, error) {
+	key := stringToKey(name)
+
+	value, err := c.tree.Search(key)
 	if err != nil {
-		return fmt.Errorf("failed to scan system catalog: %w", err)
+		return nil, fmt.Errorf("table '%s' not found in catalog", name)
 	}
 
-	maxID := uint64(0)
-
-	for _, btreeEntry := range entries {
-		entry, err := c.deserializeEntry(btreeEntry.Value)
-		if err != nil {
-			fmt.Printf("Warning: skipping invalid catalog entry (key %d): %v\n",
-				btreeEntry.Key, err)
-			continue
-		}
-
-		switch entry.Type {
-		case "table":
-			if err := c.loadTableEntry(entry); err != nil {
-				fmt.Printf("Warning: failed to load table '%s': %v\n", entry.Name, err)
-			}
-		case "index":
-			if err := c.loadIndexEntry(entry); err != nil {
-				fmt.Printf("Warning: failed to load index '%s': %v\n", entry.Name, err)
-			}
-		default:
-			fmt.Printf("Warning: unknown entry type '%s' for '%s'\n", entry.Type, entry.Name)
-		}
-
-		if btreeEntry.Key > maxID {
-			maxID = btreeEntry.Key
-		}
+	var meta metadataEntry
+	if err := json.Unmarshal(value, &meta); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 
-	c.nextEntryID = maxID + 1
-	return nil
+	if meta.Type != "table" {
+		return nil, fmt.Errorf("entry '%s' is not a table", name)
+	}
+
+	var table Schema
+	if err := json.Unmarshal(meta.Data, &table); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal table: %w", err)
+	}
+
+	if table.RootPage == 0 {
+		return nil, fmt.Errorf("invalid root page (0) for table %s", table.Name)
+	}
+	if table.RootPage > c.pager.GetNumPages() {
+		return nil, fmt.Errorf("root page %d out of range for table %s", table.RootPage, table.Name)
+	}
+
+	return &table, nil
 }
 
-func (c *Catalog) loadTableEntry(entry *catalogEntry) error {
-	var columns []Column
-	if err := json.Unmarshal([]byte(entry.Columns), &columns); err != nil {
-		return fmt.Errorf("failed to unmarshal columns: %w", err)
-	}
+func (c *Catalog) loadIndexFromDisk(name string) (*IndexMetadata, error) {
+	key := stringToKey(name)
 
-	schema := &Schema{
-		Name:     entry.Name,
-		Columns:  columns,
-		RootPage: entry.RootPage,
-	}
-
-	c.schemas[entry.Name] = schema
-	return nil
-}
-
-func (c *Catalog) loadIndexEntry(entry *catalogEntry) error {
-	index := &IndexMetadata{
-		Name:       entry.Name,
-		TableName:  entry.TblName,
-		ColumnName: entry.IndexColumn,
-		IsUnique:   entry.IsUnique,
-		RootPage:   entry.RootPage,
-	}
-
-	c.indexes[entry.Name] = index
-	return nil
-}
-
-func (c *Catalog) insertEntry(entry catalogEntry) error {
-	data, err := json.Marshal(entry)
+	value, err := c.tree.Search(key)
 	if err != nil {
-		return fmt.Errorf("failed to serialize entry: %w", err)
+		return nil, fmt.Errorf("index '%s' not found in catalog", name)
 	}
 
-	key := c.nextEntryID
-	if err := c.systemBTree.Insert(key, data); err != nil {
-		return err
+	var meta metadataEntry
+	if err := json.Unmarshal(value, &meta); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal metadata: %w", err)
 	}
 
-	c.nextEntryID++
-	return nil
+	if meta.Type != "index" {
+		return nil, fmt.Errorf("entry '%s' is not an index", name)
+	}
+
+	var index IndexMetadata
+	if err := json.Unmarshal(meta.Data, &index); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal index: %w", err)
+	}
+
+	if index.RootPage == 0 {
+		return nil, fmt.Errorf("invalid root page (0) for index %s", index.Name)
+	}
+	if index.RootPage > c.pager.GetNumPages() {
+		return nil, fmt.Errorf("root page %d out of range for index %s", index.RootPage, index.Name)
+	}
+
+	return &index, nil
 }
 
-func (c *Catalog) deserializeEntry(data []byte) (*catalogEntry, error) {
-	var entry catalogEntry
-	if err := json.Unmarshal(data, &entry); err != nil {
-		return nil, err
-	}
-
-	if entry.Type == "" || entry.Name == "" || entry.TblName == "" {
-		return nil, errors.New("missing required fields in catalog entry")
-	}
-
-	return &entry, nil
-}
-
-func (c *Catalog) CreateTable(tableName string, columns []Column) (*Schema, error) {
-
-	if tableName == "" {
+func (c *Catalog) CreateTable(name string, columns []Column) (*Schema, error) {
+	if name == "" {
 		return nil, errors.New("table name cannot be empty")
 	}
-	if c.TableExists(tableName) {
-		return nil, fmt.Errorf("table '%s' already exists", tableName)
+	if c.tableExistsUnsafe(name) {
+		return nil, fmt.Errorf("table '%s' already exists", name)
 	}
 	if len(columns) == 0 {
 		return nil, errors.New("table must have at least one column")
 	}
 
-	primaryKeyCount := 0
-	for _, col := range columns {
-		if col.PrimaryKey {
-			primaryKeyCount++
-		}
-	}
-	if primaryKeyCount > 1 {
-		return nil, errors.New("table cannot have more than one primary key column")
+	if err := validateColumns(columns); err != nil {
+		return nil, err
 	}
 
-	btree, err := storage.NewBTree(c.pager)
+	tree, err := storage.NewBTree(c.pager, false)
 	if err != nil {
-		return nil, fmt.Errorf("failed to allocate B-tree: %w", err)
+		return nil, fmt.Errorf("failed to allocate tree: %w", err)
 	}
 
 	schema := &Schema{
-		Name:     tableName,
+		Name:     name,
 		Columns:  columns,
-		RootPage: btree.GetRootPage(),
+		RootPage: tree.GetRootPage(),
+		Version:  1,
 	}
 
-	columnsJSON, err := json.Marshal(columns)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal columns: %w", err)
+	if err := c.saveTable(schema); err != nil {
+		// TODO: Add pages to freelist when implemented
+		return nil, err
 	}
 
-	entry := catalogEntry{
-		Type:     "table",
-		Name:     tableName,
-		TblName:  tableName,
-		RootPage: schema.RootPage,
-		Columns:  string(columnsJSON),
+	c.tableCache.Put(name, schema)
+
+	if err := c.createAutoIndexes(schema); err != nil {
+		if deleteErr := c.deleteTableUnsafe(name); deleteErr != nil {
+			fmt.Printf("Error: failed to rollback table creation: %v\n", deleteErr)
+		}
+		return nil, fmt.Errorf("failed to create auto indexes: %w", err)
 	}
 
-	if err := c.insertEntry(entry); err != nil {
-		return nil, fmt.Errorf("failed to persist table: %w", err)
-	}
+	return schema, nil
+}
 
-	c.schemas[tableName] = schema
+func validateColumns(columns []Column) error {
+	pkCount := 0
+	names := make(map[string]bool)
 
-	var createdIndexes []*IndexMetadata
 	for _, col := range columns {
-		var indexName string
-		var isUnique bool
-		var shouldCreateIndex bool
+		if col.Name == "" {
+			return errors.New("column name cannot be empty")
+		}
+
+		if names[col.Name] {
+			return fmt.Errorf("duplicate column name: %s", col.Name)
+		}
+		names[col.Name] = true
 
 		if col.PrimaryKey {
-			indexName = fmt.Sprintf("pk_%s_%s", tableName, col.Name)
-			isUnique = true
-			shouldCreateIndex = true
+			pkCount++
+		}
+	}
+
+	if pkCount > 1 {
+		return errors.New("table can have at most one primary key")
+	}
+
+	return nil
+}
+
+func (c *Catalog) saveTable(schema *Schema) error {
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return fmt.Errorf("failed to marshal table: %w", err)
+	}
+
+	meta := metadataEntry{
+		Type: "table",
+		Data: data,
+	}
+
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
+
+	key := stringToKey(schema.Name)
+
+	if err := c.tree.Insert(key, metaBytes); err != nil {
+		return fmt.Errorf("failed to insert table into catalog: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Catalog) createAutoIndexes(schema *Schema) error {
+	for _, col := range schema.Columns {
+		var indexName string
+		var unique bool
+
+		if col.PrimaryKey {
+			indexName = fmt.Sprintf("pk_%s_%s", schema.Name, col.Name)
+			unique = true
 		} else if col.Unique {
-			indexName = fmt.Sprintf("unique_%s_%s", tableName, col.Name)
-			isUnique = true
-			shouldCreateIndex = true
+			indexName = fmt.Sprintf("uq_%s_%s", schema.Name, col.Name)
+			unique = true
 		} else {
 			continue
 		}
 
-		if shouldCreateIndex {
-
-			index, err := c.createIndexInternal(indexName, tableName, col.Name, isUnique)
-			if err != nil {
-
-				c.rollbackTableCreation(tableName, createdIndexes)
-				return nil, fmt.Errorf("failed to create auto-index '%s': %w", indexName, err)
-			}
-			createdIndexes = append(createdIndexes, index)
+		if _, err := c.createIndexUnsafe(indexName, schema.Name, col.Name, unique); err != nil {
+			return err
 		}
 	}
 
-	return schema, nil
-}
-
-func isUniqueColumn(col Column) bool {
-	return col.Unique
-}
-
-func (c *Catalog) createIndexInternal(indexName, tableName, columnName string, unique bool) (*IndexMetadata, error) {
-
-	schema, err := c.GetSchema(tableName)
-	if err != nil {
-		return nil, err
-	}
-
-	btree, err := storage.NewBTree(c.pager)
-	if err != nil {
-		return nil, fmt.Errorf("failed to allocate index B-tree: %w", err)
-	}
-
-	index := &IndexMetadata{
-		Name:       indexName,
-		TableName:  tableName,
-		ColumnName: columnName,
-		IsUnique:   unique,
-		RootPage:   btree.GetRootPage(),
-	}
-
-	if err := c.populateIndex(index, schema, btree); err != nil {
-		return nil, fmt.Errorf("failed to populate index: %w", err)
-	}
-
-	entry := catalogEntry{
-		Type:        "index",
-		Name:        indexName,
-		TblName:     tableName,
-		RootPage:    index.RootPage,
-		IndexColumn: columnName,
-		IsUnique:    unique,
-	}
-
-	if err := c.insertEntry(entry); err != nil {
-		return nil, fmt.Errorf("failed to persist index: %w", err)
-	}
-
-	c.indexes[indexName] = index
-	return index, nil
-}
-
-func (c *Catalog) rollbackTableCreation(tableName string, indexes []*IndexMetadata) {
-
-	for _, idx := range indexes {
-		delete(c.indexes, idx.Name)
-		c.deleteEntryByName("index", idx.Name)
-	}
-
-	delete(c.schemas, tableName)
-	c.deleteEntryByName("table", tableName)
-}
-
-func (c *Catalog) GetSchema(tableName string) (*Schema, error) {
-	schema, exists := c.schemas[tableName]
-	if !exists {
-		return nil, fmt.Errorf("table '%s' does not exist", tableName)
-	}
-	return schema, nil
-}
-
-func (c *Catalog) TableExists(tableName string) bool {
-	_, exists := c.schemas[tableName]
-	return exists
-}
-
-func (c *Catalog) ListTables() []string {
-	tables := make([]string, 0, len(c.schemas))
-	for name := range c.schemas {
-		if name != SystemTableName {
-			tables = append(tables, name)
-		}
-	}
-	return tables
-}
-
-func (c *Catalog) DropTable(tableName string) error {
-	if tableName == SystemTableName {
-		return errors.New("cannot drop system catalog")
-	}
-	if !c.TableExists(tableName) {
-		return fmt.Errorf("table '%s' does not exist", tableName)
-	}
-
-	for _, index := range c.GetIndexes(tableName) {
-		if err := c.DropIndex(index.Name); err != nil {
-			return fmt.Errorf("failed to drop index '%s': %w", index.Name, err)
-		}
-	}
-
-	if err := c.deleteEntryByName("table", tableName); err != nil {
-		return err
-	}
-
-	delete(c.schemas, tableName)
 	return nil
 }
 
-func (c *Catalog) CreateIndex(indexName, tableName, columnName string, unique bool) (*IndexMetadata, error) {
+func (c *Catalog) CreateIndex(name, tableName, columnName string, unique bool) (*IndexMetadata, error) {
+	return c.createIndexUnsafe(name, tableName, columnName, unique)
+}
 
-	if indexName == "" {
+func (c *Catalog) createIndexUnsafe(name, tableName, columnName string, unique bool) (*IndexMetadata, error) {
+	if name == "" {
 		return nil, errors.New("index name cannot be empty")
 	}
-	if c.IndexExists(indexName) {
-		return nil, fmt.Errorf("index '%s' already exists", indexName)
+	if c.indexExistsUnsafe(name) {
+		return nil, fmt.Errorf("index '%s' already exists", name)
 	}
 
-	schema, err := c.GetSchema(tableName)
+	table, err := c.getTableUnsafe(tableName)
 	if err != nil {
 		return nil, err
 	}
 
-	column, err := schema.GetColumn(columnName)
-	if err != nil {
+	column := table.GetColumn(columnName)
+	if column == nil {
 		return nil, fmt.Errorf("column '%s' not found in table '%s'", columnName, tableName)
 	}
 
-	btree, err := storage.NewBTree(c.pager)
+	tree, err := storage.NewBTree(c.pager, true)
 	if err != nil {
-		return nil, fmt.Errorf("failed to allocate index B-tree: %w", err)
+		return nil, fmt.Errorf("failed to allocate index tree: %w", err)
 	}
 
 	index := &IndexMetadata{
-		Name:       indexName,
+		Name:       name,
 		TableName:  tableName,
 		ColumnName: columnName,
-		IsUnique:   unique,
-		RootPage:   btree.GetRootPage(),
+		Unique:     unique,
+		RootPage:   tree.GetRootPage(),
 	}
 
-	if err := c.populateIndex(index, schema, btree); err != nil {
+	if err := c.populateIndex(index, table, tree); err != nil {
+		// TODO: Add pages to freelist when implemented
 		return nil, fmt.Errorf("failed to populate index: %w", err)
 	}
 
-	entry := catalogEntry{
-		Type:        "index",
-		Name:        indexName,
-		TblName:     tableName,
-		RootPage:    index.RootPage,
-		IndexColumn: columnName,
-		IsUnique:    unique,
+	if err := c.saveIndex(index); err != nil {
+		// TODO: Add pages to freelist when implemented
+		return nil, err
 	}
 
-	if err := c.insertEntry(entry); err != nil {
-		return nil, fmt.Errorf("failed to persist index: %w", err)
-	}
-
-	c.indexes[indexName] = index
+	c.indexCache.Put(name, index)
 	return index, nil
 }
 
-func (c *Catalog) populateIndex(index *IndexMetadata, schema *Schema, indexBTree *storage.BTree) error {
-
-	tableBTree, err := storage.LoadBTree(c.pager, schema.RootPage)
+func (c *Catalog) saveIndex(index *IndexMetadata) error {
+	data, err := json.Marshal(index)
 	if err != nil {
-		return fmt.Errorf("failed to load table B-tree: %w", err)
+		return fmt.Errorf("failed to marshal index: %w", err)
 	}
 
-	column, err := schema.GetColumn(index.ColumnName)
-	if err != nil {
-		return err
+	meta := metadataEntry{
+		Type: "index",
+		Data: data,
 	}
 
-	seenValues := make(map[string]bool)
+	metaBytes, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
 
-	entries, err := tableBTree.Scan()
+	key := stringToKey(index.Name)
+	if err := c.tree.Insert(key, metaBytes); err != nil {
+		return fmt.Errorf("failed to insert index into catalog: %w", err)
+	}
+
+	return nil
+}
+
+func (c *Catalog) populateIndex(index *IndexMetadata, table *Schema, indexTree *storage.BTree) error {
+	dataTree, err := storage.LoadBTree(c.pager, table.RootPage, false)
+	if err != nil {
+		return fmt.Errorf("failed to load table tree: %w", err)
+	}
+
+	entries, err := dataTree.Scan()
 	if err != nil {
 		return fmt.Errorf("failed to scan table: %w", err)
 	}
 
 	for _, entry := range entries {
-
 		row, err := DeserializeRow(entry.Value)
 		if err != nil {
 			return fmt.Errorf("failed to deserialize row: %w", err)
 		}
 
-		columnValue, columnType, err := ExtractColumnValue(row, index.ColumnName)
+		colValue, colType, err := ExtractColumnValue(row, index.ColumnName)
 		if err != nil {
 			return fmt.Errorf("failed to extract column value: %w", err)
 		}
 
-		indexKey, err := ValueToKey(columnValue, columnType)
+		indexKey, err := ValueToKey(colValue, colType)
 		if err != nil {
 			return fmt.Errorf("failed to convert value to key: %w", err)
 		}
 
-		if index.IsUnique {
-			keyStr := indexKey.String()
-			if seenValues[keyStr] {
-				return fmt.Errorf("duplicate value '%v' found for unique index on column '%s'",
-					columnValue, index.ColumnName)
-			}
-			seenValues[keyStr] = true
-		}
-
 		indexValue := entry.Key.Encode()
 
-		if err := indexBTree.Insert(indexKey, indexValue); err != nil {
+		if err := indexTree.Insert(indexKey, indexValue); err != nil {
+			if index.Unique && err.Error() == "duplicate key" {
+				return fmt.Errorf("duplicate value '%s' for unique index on column %s",
+					indexKey.String(), index.ColumnName)
+			}
 			return fmt.Errorf("failed to insert into index: %w", err)
 		}
 	}
@@ -529,98 +421,280 @@ func (c *Catalog) populateIndex(index *IndexMetadata, schema *Schema, indexBTree
 	return nil
 }
 
-func (c *Catalog) GetIndex(indexName string) (*IndexMetadata, error) {
-	index, exists := c.indexes[indexName]
-	if !exists {
-		return nil, fmt.Errorf("index '%s' does not exist", indexName)
+func stringToKey(s string) storage.Key {
+	return storage.NewTextKey(s)
+}
+
+func (c *Catalog) GetTable(name string) (*Schema, error) {
+	return c.getTableUnsafe(name)
+}
+
+func (c *Catalog) getTableUnsafe(name string) (*Schema, error) {
+	if cached, exists := c.tableCache.Get(name); exists {
+		return cached.(*Schema), nil
 	}
+
+	table, err := c.loadTableFromDisk(name)
+	if err != nil {
+		return nil, err
+	}
+
+	c.tableCache.Put(name, table)
+
+	return table, nil
+}
+
+func (c *Catalog) LoadTable(name string) (*Table, error) {
+	schema, err := c.getTableUnsafe(name)
+
+	if err != nil {
+		return nil, err
+	}
+
+	btree, err := storage.LoadBTree(c.pager, schema.RootPage, false)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load table B-tree: %w", err)
+	}
+
+	return &Table{
+		Catalog: c,
+		schema:  schema,
+		btree:   btree,
+	}, nil
+}
+
+func (c *Catalog) GetIndex(name string) (*IndexMetadata, error) {
+
+	return c.getIndexUnsafe(name)
+}
+
+func (c *Catalog) getIndexUnsafe(name string) (*IndexMetadata, error) {
+	if cached, exists := c.indexCache.Get(name); exists {
+		return cached.(*IndexMetadata), nil
+	}
+
+	index, err := c.loadIndexFromDisk(name)
+	if err != nil {
+		return nil, err
+	}
+
+	c.indexCache.Put(name, index)
+
 	return index, nil
 }
 
-func (c *Catalog) GetIndexes(tableName string) []*IndexMetadata {
-	var indexes []*IndexMetadata
-	for _, idx := range c.indexes {
-		if idx.TableName == tableName {
-			indexes = append(indexes, idx)
-		}
-	}
-	return indexes
+func (c *Catalog) TableExists(name string) bool {
+
+	return c.tableExistsUnsafe(name)
 }
 
-func (c *Catalog) IndexExists(indexName string) bool {
-	_, exists := c.indexes[indexName]
-	return exists
-}
-
-func (c *Catalog) ListIndexes() []string {
-	indexes := make([]string, 0, len(c.indexes))
-	for name := range c.indexes {
-		indexes = append(indexes, name)
-	}
-	return indexes
-}
-
-func (c *Catalog) DropIndex(indexName string) error {
-	if !c.IndexExists(indexName) {
-		return fmt.Errorf("index '%s' does not exist", indexName)
+func (c *Catalog) tableExistsUnsafe(name string) bool {
+	if _, exists := c.tableCache.Get(name); exists {
+		return true
 	}
 
-	if err := c.deleteEntryByName("index", indexName); err != nil {
-		return err
-	}
-
-	delete(c.indexes, indexName)
-	return nil
+	_, err := c.loadTableFromDisk(name)
+	return err == nil
 }
 
-func (c *Catalog) deleteEntryByName(entryType, name string) error {
-	entries, err := c.systemBTree.Scan()
+func (c *Catalog) IndexExists(name string) bool {
+
+	return c.indexExistsUnsafe(name)
+}
+
+func (c *Catalog) indexExistsUnsafe(name string) bool {
+	if _, exists := c.indexCache.Get(name); exists {
+		return true
+	}
+
+	_, err := c.loadIndexFromDisk(name)
+	return err == nil
+}
+
+func (c *Catalog) ListTables() []string {
+
+	entries, err := c.tree.Scan()
 	if err != nil {
-		return fmt.Errorf("failed to scan catalog: %w", err)
+		return []string{}
 	}
 
-	for _, btreeEntry := range entries {
-		entry, err := c.deserializeEntry(btreeEntry.Value)
-		if err != nil {
+	tables := make([]string, 0)
+	for _, entry := range entries {
+		var meta metadataEntry
+		if err := json.Unmarshal(entry.Value, &meta); err != nil {
 			continue
 		}
 
-		if entry.Type == entryType && entry.Name == name {
-			if err := c.systemBTree.Delete(btreeEntry.Key); err != nil {
-				return fmt.Errorf("failed to delete catalog entry: %w", err)
-			}
-			return nil
+		if meta.Type != "table" {
+			continue
+		}
+
+		var table Schema
+		if err := json.Unmarshal(meta.Data, &table); err != nil {
+			continue
+		}
+
+		if table.Name != SystemCatalogTable {
+			tables = append(tables, table.Name)
 		}
 	}
 
-	return fmt.Errorf("%s '%s' not found in catalog", entryType, name)
+	return tables
 }
 
-func (c *Catalog) ValidateInsert(tableName string, valueCount int) error {
-	schema, err := c.GetSchema(tableName)
+func (c *Catalog) ListIndexes() []string {
+	entries, err := c.tree.Scan()
 	if err != nil {
-		return err
+		return []string{}
 	}
 
-	if valueCount != schema.ColumnCount() {
-		return fmt.Errorf("column count mismatch: got %d, expected %d",
-			valueCount, schema.ColumnCount())
+	indexes := make([]string, 0)
+	for _, entry := range entries {
+		var meta metadataEntry
+		if err := json.Unmarshal(entry.Value, &meta); err != nil {
+			continue
+		}
+
+		if meta.Type != "index" {
+			continue
+		}
+
+		var index IndexMetadata
+		if err := json.Unmarshal(meta.Data, &index); err != nil {
+			continue
+		}
+
+		indexes = append(indexes, index.Name)
 	}
 
+	return indexes
+}
+
+func (c *Catalog) GetTableIndexes(tableName string) []*IndexMetadata {
+
+	entries, err := c.tree.Scan()
+	if err != nil {
+		return []*IndexMetadata{}
+	}
+
+	result := make([]*IndexMetadata, 0)
+	for _, entry := range entries {
+		var meta metadataEntry
+		if err := json.Unmarshal(entry.Value, &meta); err != nil {
+			continue
+		}
+
+		if meta.Type != "index" {
+			continue
+		}
+
+		var index IndexMetadata
+		if err := json.Unmarshal(meta.Data, &index); err != nil {
+			continue
+		}
+
+		if index.TableName == tableName {
+			result = append(result, &index)
+		}
+	}
+
+	return result
+}
+
+func (c *Catalog) DropTable(name string) error {
+
+	if name == SystemCatalogTable {
+		return errors.New("cannot drop system catalog")
+	}
+	if !c.tableExistsUnsafe(name) {
+		return fmt.Errorf("table '%s' does not exist", name)
+	}
+
+	indexes := c.GetTableIndexes(name)
+	for _, idx := range indexes {
+		if err := c.dropIndexUnsafe(idx.Name); err != nil {
+			return fmt.Errorf("failed to drop index '%s': %w", idx.Name, err)
+		}
+	}
+
+	// TODO: Free all pages in the table's B-tree when freelist is implemented
+
+	key := stringToKey(name)
+	if err := c.tree.Delete(key); err != nil {
+		return fmt.Errorf("failed to delete table metadata: %w", err)
+	}
+
+	c.tableCache.Delete(name)
 	return nil
 }
 
-func (c *Catalog) PrintCatalog() error {
-	fmt.Println("\n=== System Catalog ===")
-	fmt.Printf("Next Entry ID: %d\n\n", c.nextEntryID)
+func (c *Catalog) DropIndex(name string) error {
 
-	fmt.Println("Tables:")
-	for name, schema := range c.schemas {
-		fmt.Printf("  %s (root page: %d)\n", name, schema.RootPage)
-		for _, col := range schema.Columns {
+	return c.dropIndexUnsafe(name)
+}
+
+func (c *Catalog) dropIndexUnsafe(name string) error {
+	if !c.indexExistsUnsafe(name) {
+		return fmt.Errorf("index '%s' does not exist", name)
+	}
+
+	// TODO: Free all pages in the index's B-tree when freelist is implemented
+
+	key := stringToKey(name)
+	if err := c.tree.Delete(key); err != nil {
+		return fmt.Errorf("failed to delete index metadata: %w", err)
+	}
+
+	c.indexCache.Delete(name)
+	return nil
+}
+
+func (c *Catalog) deleteTableUnsafe(name string) error {
+	key := stringToKey(name)
+	if err := c.tree.Delete(key); err != nil {
+		return fmt.Errorf("failed to delete table from catalog: %w", err)
+	}
+	c.tableCache.Delete(name)
+	return nil
+}
+
+func (t *Schema) GetColumn(name string) *Column {
+	for i := range t.Columns {
+		if t.Columns[i].Name == name {
+			return &t.Columns[i]
+		}
+	}
+	return nil
+}
+
+func (t *Schema) GetColumnIndex(name string) int {
+	for i := range t.Columns {
+		if t.Columns[i].Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func (t *Schema) ColumnCount() int {
+	return len(t.Columns)
+}
+
+func (c *Catalog) Print() {
+	fmt.Println("\n=== Database Catalog ===")
+
+	tables := c.ListTables()
+	fmt.Printf("\nTables (%d):\n", len(tables))
+	for _, name := range tables {
+		table, err := c.getTableUnsafe(name)
+		if err != nil {
+			continue
+		}
+		fmt.Printf("  %s (page %d, version %d)\n", name, table.RootPage, table.Version)
+		for _, col := range table.Columns {
 			flags := ""
 			if col.PrimaryKey {
-				flags += " PRIMARY KEY"
+				flags += " PK"
 			}
 			if col.Unique {
 				flags += " UNIQUE"
@@ -632,18 +706,37 @@ func (c *Catalog) PrintCatalog() error {
 		}
 	}
 
-	if len(c.indexes) > 0 {
-		fmt.Println("\nIndexes:")
-		for name, idx := range c.indexes {
-			uniqueStr := ""
-			if idx.IsUnique {
-				uniqueStr = " UNIQUE"
+	indexes := c.ListIndexes()
+	if len(indexes) > 0 {
+		fmt.Printf("\nIndexes (%d):\n", len(indexes))
+		for _, name := range indexes {
+			idx, err := c.getIndexUnsafe(name)
+			if err != nil {
+				continue
 			}
-			fmt.Printf("  %s%s ON %s(%s) (root page: %d)\n",
-				name, uniqueStr, idx.TableName, idx.ColumnName, idx.RootPage)
+			uniqueFlag := ""
+			if idx.Unique {
+				uniqueFlag = " [UNIQUE]"
+			}
+			fmt.Printf("  %s%s ON %s.%s (page %d)\n",
+				name, uniqueFlag, idx.TableName, idx.ColumnName, idx.RootPage)
 		}
 	}
 
 	fmt.Println()
-	return nil
+}
+
+func (c *Catalog) LoadIndexTree(indexName string) (*storage.BTree, error) {
+	index, err := c.getIndexUnsafe(indexName)
+
+	if err != nil {
+		return nil, err
+	}
+
+	tree, err := storage.LoadBTree(c.pager, index.RootPage, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load index B-tree: %w", err)
+	}
+
+	return tree, nil
 }
