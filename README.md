@@ -5,6 +5,12 @@
 <em>A persistent, B+Tree backed SQL database engine written from scratch in Go.</em>
 </p>
 
+<p align="center">
+<a href="https://github.com/kithinjibrian/anubisdb/blob/main/docs/anubis.md">
+<img src="https://img.shields.io/badge/Anubis Documentation-blue" alt="docs" />
+</a>
+</p>
+
 ---
 
 ## Overview
